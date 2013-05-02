@@ -1,13 +1,11 @@
 package com.pnwrain.flashsocket
 {
-	import com.adobe.serialization.json.JSON;
 	import com.pnwrain.flashsocket.events.FlashSocketEvent;
 	
 	import flash.events.Event;
 	import flash.events.EventDispatcher;
 	import flash.events.HTTPStatusEvent;
 	import flash.events.IOErrorEvent;
-	import flash.events.SecurityErrorEvent;
 	import flash.events.TimerEvent;
 	import flash.net.URLLoader;
 	import flash.net.URLRequest;
@@ -15,206 +13,198 @@ package com.pnwrain.flashsocket
 	import flash.system.Security;
 	import flash.utils.Timer;
 	
-	import mx.collections.ArrayCollection;
 	import mx.utils.URLUtil;
+	
+	import net.gimite.websocket.*;
+	
 
-	public class FlashSocket extends EventDispatcher implements IWebSocketWrapper
+	public class FlashSocket extends EventDispatcher implements IWebSocketLogger
 	{
-		protected var debug:Boolean = false;
-		protected var callerUrl:String;
-		protected var socketURL:String;
-		protected var webSocket:WebSocket;
-		
-		//vars returned from discovery
-		public var sessionID:String;
-		protected var heartBeatTimeout:int;
-		protected var connectionClosingTimeout:int;
-		protected var protocols:Array;
-		
-		//hold over variables from constructor for discover to use
-		private var domain:String;
-		private var protocol:String;
-		private var proxyHost:String;
-		private var proxyPort:int;
-		private var headers:String;
-		private var timer:Timer;
-		
-		private var ackRegexp:RegExp = new RegExp('(\\d+)\\+(.*)');
-		private var ackId:int = 0;
-		private var acks:Object = { };
-		
-		public function FlashSocket( domain:String, protocol:String=null, proxyHost:String = null, proxyPort:int = 0, headers:String = null)
-		{
-			var httpProtocal:String = "http";
-			var webSocketProtocal:String = "ws";
-			
-			if (URLUtil.isHttpsURL(domain)) {
-				httpProtocal = "https";
-				webSocketProtocal = "wss";
-			}
-			
-			//if the user passed in http:// or https:// we want to strip that out
-			if(domain.indexOf('://')>=0){
-				domain = URLUtil.getServerNameWithPort(domain);
-			}
 
-			this.socketURL = webSocketProtocal+"://" + domain + "/socket.io/1/flashsocket";
-			this.callerUrl = httpProtocal+"://localhost/socket.swf";
+
+		public static const STATUS_READY        = "STATUS_READY";
+		public static const STATUS_CONNECTED    = "STATUS_CONNECTED";
+		public static const STATUS_CONNECTING   = "STATUS_CONNECTING";
+		public static const STATUS_DISCONNECTED = "STATUS_DISCONNECTED";
+
+		public var status:String;
+
+		private var debug:Boolean = false;
+		private var webSocket:WebSocket;
+		private var loader:URLLoader;	
+
+		public var sessionID:String;
+		
+		private var domain:String;
+		private var endPoint:String;
+		private var protocol:String;
+		private var headers:Array;
+		private var isSecureConnection:Boolean;
+
+		private var heartBeatTimer:Timer;
+		private var connectionTimeoutTimer:Timer;
+		
+		private var ackId:int   = 0;
+		private var acks:Object = {};
+		
+		public function FlashSocket( domain:String, headers:Array = null)
+		{
+
+			if(domain.indexOf('://')){
+				var spliters:Array = domain.split('://',2);
+				isSecureConnection = spliters[0]=="https"
+				domain 			   = spliters[1]
+			}
 			
-			this.domain = domain;
-			this.protocol = protocol;
-			this.proxyHost = proxyHost;
-			this.proxyPort = proxyPort;
+			if(domain.lastIndexOf('/')){
+				var spliters:Array = domain.split('/',2);
+				domain = spliters[0];
+				endPoint = '/'+spliters[1];
+			}
+			
+			this.domain  = domain;
 			this.headers = headers;
 			
-			var r:URLRequest = new URLRequest();
-			r.url = httpProtocal+"://" + domain + "/socket.io/1/?time=" + new Date().getTime();
-			r.method = URLRequestMethod.POST;
-			var ul:URLLoader = new URLLoader(r);
-			ul.addEventListener(Event.COMPLETE, onDiscover);
-			ul.addEventListener(HTTPStatusEvent.HTTP_STATUS, onDiscoverError);
-			ul.addEventListener(IOErrorEvent.IO_ERROR , onDiscoverError);
+			loader = new URLLoader();
+			loader.addEventListener(Event.COMPLETE, onDiscover);
+			loader.addEventListener(HTTPStatusEvent.HTTP_STATUS, onDiscoverError);
+			loader.addEventListener(IOErrorEvent.IO_ERROR ,onDiscoverError);
 
+			heartBeatTimer         = new Timer(0);
+			connectionTimeoutTimer = new Timer(0);
+			heartBeatTimer.addEventListener(TimerEvent.TIMER, onHeartBeat);
+			connectionTimeoutTimer.addEventListener(TimerEvent.TIMER, onConnectionTimeout);
+
+			status = STATUS_READY
 		}
+
+
+
+		public function connect():void{
+			if(status != STATUS_READY)close();
+
+			var httpProtocal:String = isSecureConnection?"https":"http";
+
+			var req:URLRequest = new URLRequest();
+			req.url            = httpProtocal+"://" + domain + "/socket.io/1/?time=" + new Date().time
+			req.method         = URLRequestMethod.POST;
+			req.requestHeaders = headers;
+			
+			loader.load(req);
+
+			status = STATUS_CONNECTING;
+		}
+
+
+		public function close():void{
+			if(status == STATUS_READY)return;
+			
+			heartBeatTimer.stop();
+			connectionTimeoutTimer.stop();
+			
+			if(status == STATUS_CONNECTING)loader.close();
+
+			if(webSocket){
+				webSocket.removeEventListener(WebSocketEvent.MESSAGE, onData);
+				webSocket.removeEventListener(WebSocketEvent.CLOSE, onClose);
+				webSocket.removeEventListener(WebSocketEvent.ERROR, onIoError);
+				webSocket.close();
+				webSocket = null 			
+			}
+
+			status = STATUS_READY;
+		}
+
 		
-		protected function onDiscover(event:Event):void{
+		private function onDiscover(event:Event):void{
+			if(status != STATUS_CONNECTING) return;
+
 			var response:String = event.target.data;
 			var respData:Array = response.split(":");
-			sessionID = respData[0];
-			heartBeatTimeout = respData[1];
-			connectionClosingTimeout = respData[2];
-			protocols = respData[3].toString().split(",");
+
+			sessionID                 = respData[0];
+			var heartBeatTimeout:int  = int(respData[1]);
+			var connectionTimeout:int = int(respData[2]);
+			var protocols:Array       = respData[3].toString().split(",");
 			
-			timer = new Timer( Math.ceil(heartBeatTimeout*.75)*1000);
-			timer.addEventListener(TimerEvent.TIMER, onHeartBeatTimer);
-			//timer.start();
-			
-			var flashSupported:Boolean = false;
-			for ( var i:int=0; i<protocols.length; i++ ){
-				if ( protocols[i] == "flashsocket" ){
-					flashSupported = true;
-					break;
-				}
-			}
-			this.socketURL = this.socketURL + "/" + sessionID;
-			
-			
-			onHandshake(event);
-			
+			heartBeatTimer.delay         = heartBeatTimeout*1000*.8
+			connectionTimeoutTimer.delay = connectionTimeout*1000
+
+			if(protocols.indexOf("websocket") == -1)throw("server does not support websocket");
+
+			var webSocketProtocal:String = isSecureConnection?"wss":"ws"
+			var socketURL:String = webSocketProtocal+"://" + domain + "/socket.io/1/websocket/" + sessionID;
+			onHandshake(socketURL);
 		}
-		protected function onHandshake(event:Event):void{
-			
+
+		private function onHandshake(socketURL:String):void{
+			if(status != STATUS_CONNECTING) return;
+
 			loadDefaultPolicyFile(socketURL);
-			webSocket = new WebSocket(this, socketURL, protocol, proxyHost, proxyPort, headers);
-			webSocket.addEventListener("event", onData);
-			webSocket.addEventListener(Event.CLOSE, onClose);
-			webSocket.addEventListener(Event.CONNECT, onConnect);
-			webSocket.addEventListener(IOErrorEvent.IO_ERROR, onIoError);
-			webSocket.addEventListener(SecurityErrorEvent.SECURITY_ERROR, onSecurityError);
-		}
-		protected function onHeartBeatTimer(event:TimerEvent):void{
-			this._onHeartbeat();
+			webSocket = new WebSocket(23,socketURL,[],"",null,null,null,null,this);
+			webSocket.addEventListener(WebSocketEvent.MESSAGE, onData);
+			webSocket.addEventListener(WebSocketEvent.CLOSE, onClose);
+			webSocket.addEventListener(WebSocketEvent.ERROR, onIoError);
+			
+			status = STATUS_CONNECTED;
 		}
 		
-		protected function onDiscoverError(event:Event):void{
-			if ( event is HTTPStatusEvent ){
-				if ( (event as HTTPStatusEvent).status != 200){
-					//we were unsuccessful in connecting to server for discovery
-					var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CONNECT_ERROR);
-					dispatchEvent(fe);
-				}
-			}
+		private function onHeartBeat(event:TimerEvent):void{
+			webSocket.send('2::');
 		}
-		protected function onHandshakeError(event:Event):void{
-			if ( event is HTTPStatusEvent ){
-				if ( (event as HTTPStatusEvent).status != 200){
-					//we were unsuccessful in connecting to server for discovery
-					var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CONNECT_ERROR);
-					dispatchEvent(fe);
-				}
-			}
+
+		private function onConnectionTimeout(event:TimerEvent):void{
+			_onDisconnect()
 		}
 		
-		protected function onClose(event:Event):void{
-			var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CLOSE);
-			dispatchEvent(fe);
+		private function onDiscoverError(event:Event):void{
+			if (event is HTTPStatusEvent && (event as HTTPStatusEvent).status == 200)return;
+			status = STATUS_DISCONNECTED;
+			close();
+			dispatchEvent(new FlashSocketEvent(FlashSocketEvent.CONNECT_ERROR,this));
 		}
 		
-		protected function onConnect(event:Event):void{
-			var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CONNECT);
-			dispatchEvent(fe);
-		}
-		protected function onIoError(event:Event):void{
-			var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.IO_ERROR);
-			dispatchEvent(fe);
-		}
-		protected function onSecurityError(event:Event):void{
-			var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.SECURITY_ERROR);
-			dispatchEvent(fe);
+		private function onClose(event:Event):void{
+			status = STATUS_DISCONNECTED;
+			close();
+			dispatchEvent(new FlashSocketEvent(FlashSocketEvent.CLOSE,this));
 		}
 		
-		protected function loadDefaultPolicyFile(wsUrl:String):void {
-			var policyUrl:String = "xmlsocket://" + URLUtil.getServerName(wsUrl) + ":843";
-			log("policy file: " + policyUrl);
-			Security.loadPolicyFile(policyUrl);
+		private function onIoError(event:Event):void{
+			status = STATUS_DISCONNECTED;
+			close();
+			dispatchEvent(new FlashSocketEvent(FlashSocketEvent.CONNECT_ERROR,this));
 		}
-		
-		public function getOrigin():String {
-			return (URLUtil.getProtocol(this.callerUrl) + "://" +
-				URLUtil.getServerNameWithPort(this.callerUrl)).toLowerCase();
-		}
-		
-		public function getCallerHost():String {
-			return null;
-			//I dont think we need this
-			//return URLUtil.getServerName(this.callerUrl);
-		}
-		public function log(message:String):void {
-			if (debug) {
-				trace("webSocketLog: " + message);
-			}
-		}
+
 		
 		public function error(message:String):void {
 			trace("webSocketError: "  + message);
 		}
 		
-		public function fatal(message:String):void {
-			trace("webSocketError: " + message);
+		private function onData(e:WebSocketEvent):void{
+			var msg:String = decodeURIComponent(e.message);
+			if (msg)_onMessage(msg);
 		}
+
+		private function _onConnect():void{
+			heartBeatTimer.start();
+			connectionTimeoutTimer.start();
+
+			status = STATUS_CONNECTED;
+			dispatchEvent(new FlashSocketEvent(FlashSocketEvent.CONNECT,this));
+		};
+
+
+		private function _onDisconnect():void{
+			status = STATUS_DISCONNECTED;
+			close();			
+			dispatchEvent(new FlashSocketEvent(FlashSocketEvent.DISCONNECT,this));
+		};
 		
-		/////////////////////////////////////////////////////////////////
-		/////////////////////////////////////////////////////////////////
-		protected var frame:String = '~m~';
-		
-		protected function onData(e:*):void{
-			var event:Object = (e.target as WebSocket).receiveEvents();
-			var data:Object = event[0];
-			
-			if ( data.type == "message" ){
-				this._setTimeout();
-				var msg:String = decodeURIComponent(data.data);
-				if (msg){
-					this._onMessage(msg);
-				}
-			}else if ( data.type == "open") {
-				//this is good I think
-			}else if ( data.type == "close" ){
-				var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CLOSE);
-				dispatchEvent(fe);
-			}else{
-				
-				log("We got a data message that is not 'message': " + data.type);
-			}
-		}
-		private function _setTimeout():void{
-			
-		}
-		
-		public var connected:Boolean;
-		public var connecting:Boolean;
 		
 		private function _onMessage(message:String):void{
+			connectionTimeoutTimer.reset();
+			connectionTimeoutTimer.start();
 			//https://github.com/LearnBoost/socket.io-spec#Encoding
 			/*	0		Disconnect
 				1::	Connect
@@ -227,140 +217,122 @@ package com.pnwrain.flashsocket
 				8	noop
 			*/
 			var dm:Object = deFrame(message);
-			
+
 			switch ( dm.type ){
 				case '0':
-					this._onDisconnect();
+					_onDisconnect();
 					break;
 				case '1':
-					this._onConnect();
+					if(endPoint==null){
+						_onConnect();
+						webSocket.send('1::');
+					}else{
+						if(dm.msgEndpoint == endPoint){
+							_onConnect();
+						}else{
+							webSocket.send('1::'+endPoint);
+						}
+					}
 					break;
 				case '2':
-					this._onHeartbeat();
+					webSocket.send( '2::' );
 					break;
 				case '3':
-					var fem:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.MESSAGE);
-					fem.data = dm.msg;
-					dispatchEvent(fem);
+					dispatchEvent(new FlashSocketEvent(FlashSocketEvent.MESSAGE,this,dm.msg));
 					break;
 				case '4':
-					var fe:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.MESSAGE);
-					fe.data = JSON.decode(dm.msg);
-					dispatchEvent(fe);
+					dispatchEvent(new FlashSocketEvent(FlashSocketEvent.MESSAGE,this,dm.msg));
 					break;
 				case '5':
-					var m:Object = JSON.decode(dm.msg);
-					var e:FlashSocketEvent = new FlashSocketEvent(m.name);
-					e.data = m.args;
-					dispatchEvent(e);
+					var m:Object = JSON.parse(dm.msg);
+					var msgId:String = dm.msgId;
+					var callback:Function = null;
+					
+					if(msgId){
+						var plusIndex:uint = msgId.lastIndexOf("+");
+						var mid:uint=plusIndex==msgId.length?uint(msgId):uint(msgId.substr(0,plusIndex));
+						callback = function(data:String=null):void{
+							sendCallbackAck(data,mid);
+						}
+					}	
+
+					dispatchEvent(new FlashSocketEvent(m.name,this, m.args,callback));
 					break;
 				case '6':
-					var parts:Object =  this.ackRegexp.exec(dm.msg);
-					var id:int = int(parts[1]);
-					var args:Array = JSON.decode(parts[2]);
-					if (this.acks.hasOwnProperty(id)) {
-						var func:Function = this.acks[id] as Function;
-						//pass however many args the function is looking for back to it
-						if (args.length >  func.length) {
-							func.apply(null, args.slice(0, func.length));
-						} else {
-							func.apply(null,args);
+					var msg:String    = dm.msg;
+					var parts:Array   = msg.split('+');
+					var id:int        = int(parts[0]);					
+					var func:Function = acks[id] as Function;
+					
+					if (func!=null) {
+						var args:Array;
+						if(parts.length>1){
+							args = JSON.parse(parts[1]) as Array;
+							if(args.length>func.length)args = args.slice(0,func.length)
 						}
-						
+						func.apply(null,args);
 						delete  this.acks[id];
 					}
 					break;
-					
 			}
 			
 		}
-		protected function deFrame(message:String):Object{
-			var si:int = 0;
-			for ( var i5:int=0;i5<3;i5++){
-				si = message.indexOf(":",si+1);
-			}
-			var ds:String = message.substring(si+1,message.length);
-			return {type: message.substr(0, 1), msg: ds};
-		}
-		private function _decode(data:String):Array{
-			var messages:Array = [], number:*, n:*;
-			do {
-				if (data.substr(0, 3) !== frame) return messages;
-				data = data.substr(3);
-				number = '', n = '';
-				for (var i:int = 0, l:int = data.length; i < l; i++){
-					n = Number(data.substr(i, 1));
-					if (data.substr(i, 1) == n){
-						number += n;
-					} else {	
-						data = unescape(data.substr(number.length + frame.length));
-						number = Number(number);
-						break;
-					} 
-				}
-				messages.push(data.substr(0, number)); // here
-				data = data.substr(number);
-			} while(data !== '');
-			return messages;
+		
+		private function sendCallbackAck(data:String=null,messageid:uint=1):void{
+			webSocket.send('6:::'+messageid.toString()+'+['+data+']');
 		}
 		
-		private function _onHeartbeat():void{
-			webSocket.send( '2::' ); // echo
-		};
+		protected function deFrame(message:String):Object{
+			//[message type] ':' [message id ('+')] ':' [message endpoint] (':' [message data]) 
+			var data:Array = [4]
+			
+			var count:uint      = 0;
+			var startIndex:uint = 0;
+			var lastStart:uint  = 0;
+			
+			while((startIndex = message.indexOf(":",startIndex+1))>0&&count<3){
+				data[count] = message.slice(lastStart,startIndex);
+				lastStart=startIndex+1
+				count++;
+			}
+
+			data[count] = message.slice(lastStart)
+			return {type:data[0],msgId:data[1],msgEndpoint:data[2],msg:data[3]};
+		}
+		
 		
 		public function send(msg:Object, event:String = null,callback:Function = null):void{
-			var messageId: String = "";
-			
+			var messageId:String = "";
 			if (null != callback) {
-				//%2B is urlencode(+)
-				messageId = this.ackId.toString() + '%2B';
-				this.acks[this.ackId] = callback;
-				this.ackId++;
+				messageId = ackId.toString() + '%2B';
+				acks[this.ackId] = callback;
+				ackId++;
 			}
 			
 			if ( event == null ){
 				if ( msg is String){
-					//webSocket.send(_encode(msg));
-					webSocket.send('3:'+messageId+'::' + msg as String);
+					webSocket.send('3:'+messageId+':'+endPoint+':' + msg as String);
 				}else if ( msg is Object ){
-					webSocket.send('4:'+messageId+'::' + JSON.encode(msg));
+					webSocket.send('4:'+messageId+':'+endPoint+':' + JSON.stringify(msg));
 				}else{
 					throw("Unsupported Message Type");
 				}
 			}else{
-				webSocket.send('5:'+messageId+'::' + JSON.encode({"name":event,"args":msg}));
+				webSocket.send('5:'+messageId+':'+endPoint+':'+ JSON.stringify({"name":event,"args":msg}))
 			}
 		}
 		
-		public function emit(event:String, msg:Object,  callback:Function = null):void{
-			send(msg, event, callback) 
+		
+		private function loadDefaultPolicyFile(wsUrl:String):void {
+			var policyUrl:String = "xmlsocket://" + URLUtil.getServerName(wsUrl) + ":843";
+			Security.loadPolicyFile(policyUrl);
 		}
-		
-		private function _onConnect():void{
-			this.connected = true;
-			this.connecting = false;
-			var e:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.CONNECT);
-			dispatchEvent(e);
-		};
-		private function _onDisconnect():void{
-			this.connected = false;
-			this.connecting = false;
-			var e:FlashSocketEvent = new FlashSocketEvent(FlashSocketEvent.DISCONNECT);
-			dispatchEvent(e);
-		};
-		
-		private function _encode(messages:*, json:Boolean=false):String{
-			var ret:String = '',
-				message:String,
-				messages:* =  (messages is Array) ? messages : [messages];
-			for (var i:int = 0, l:int = messages.length; i < l; i++){
-				message = messages[i] === null || messages[i] === undefined ? '' : (messages[i].toString());
-				if ( json ) {
-					message = "~j~" + message;
-				}
-				ret += frame + message.length + frame + message;
+
+
+		public function log(message:String):void {
+			if (debug) {
+				trace("webSocketLog: " + message);
 			}
-			return ret;
-		};
+		}
 	}
 }
